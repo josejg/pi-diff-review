@@ -56,7 +56,7 @@ function escapeForInlineJson(value: string): string {
 function buildSessionHtml(data: ReviewWindowData, token: string): string {
   const templateHtml = readFileSync(join(webDir, "index.html"), "utf8");
   const payload = escapeForInlineJson(JSON.stringify(data));
-  return templateHtml.replace("__INLINE_DATA__", payload).replace("__SESSION_TOKEN__", token);
+  return templateHtml.replace("__INLINE_DATA__", payload).replaceAll("__SESSION_TOKEN__", token);
 }
 
 function getContentType(path: string): string {
