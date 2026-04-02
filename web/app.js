@@ -5,10 +5,14 @@ const _wsUrl = `${_wsProtocol}//${location.host}/?token=${encodeURIComponent(_se
 let _ws = null;
 let _wsConnected = false;
 let _disconnectBanner = null;
+let _outboundQueue = [];
 
 function _sendToHost(message) {
+  const data = JSON.stringify(message);
   if (_ws && _ws.readyState === WebSocket.OPEN) {
-    _ws.send(JSON.stringify(message));
+    _ws.send(data);
+  } else {
+    _outboundQueue.push(data);
   }
 }
 
@@ -33,6 +37,10 @@ function _connectWebSocket() {
   _ws.addEventListener("open", () => {
     _wsConnected = true;
     _hideDisconnectBanner();
+    for (const data of _outboundQueue) {
+      _ws.send(data);
+    }
+    _outboundQueue = [];
   });
 
   _ws.addEventListener("message", (event) => {
