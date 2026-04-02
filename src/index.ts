@@ -109,13 +109,13 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  async function reviewRepository(ctx: ExtensionCommandContext): Promise<void> {
+  async function reviewRepository(ctx: ExtensionCommandContext, baseRef?: string): Promise<void> {
     if (activeSession != null) {
       ctx.ui.notify("A review session is already active.", "warning");
       return;
     }
 
-    const { repoRoot, files } = await getReviewWindowData(pi, ctx.cwd);
+    const { repoRoot, files, baseRef: resolvedRef } = await getReviewWindowData(pi, ctx.cwd, baseRef || "HEAD");
     if (files.length === 0) {
       ctx.ui.notify("No reviewable files found.", "info");
       return;
@@ -134,7 +134,7 @@ export default function (pi: ExtensionAPI) {
       const key = `${scope}:${file.id}`;
       const cached = contentCache.get(key);
       if (cached != null) return cached;
-      const pending = loadReviewFileContents(pi, repoRoot, file, scope);
+      const pending = loadReviewFileContents(pi, repoRoot, file, scope, resolvedRef);
       contentCache.set(key, pending);
       return pending;
     };
@@ -195,7 +195,7 @@ export default function (pi: ExtensionAPI) {
 
     let session: ReviewSession;
     try {
-      session = await startReviewServer({ repoRoot, files }, onBrowserMessage);
+      session = await startReviewServer({ repoRoot, files, baseRef: resolvedRef }, onBrowserMessage);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(`Failed to start review server: ${msg}`, "error");
@@ -256,9 +256,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("diff-review", {
-    description: "Start a review server for git diff, last commit, and all files scopes",
-    handler: async (_args, ctx) => {
-      await reviewRepository(ctx);
+    description: "Start a review server — optional arg: base ref (e.g. /diff-review main)",
+    handler: async (args, ctx) => {
+      const baseRef = args.trim() || undefined;
+      await reviewRepository(ctx, baseRef);
     },
   });
 

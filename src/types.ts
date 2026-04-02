@@ -80,4 +80,6 @@ export type ReviewHostMessage = ReviewFileDataMessage | ReviewFileErrorMessage;
 export interface ReviewWindowData {
   repoRoot: string;
   files: ReviewFile[];
+  /** The git ref used as the diff base (e.g. "HEAD", "main", "HEAD~3"). */
+  baseRef: string;
 }

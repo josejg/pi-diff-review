@@ -149,19 +149,21 @@ function inferLanguage(path) {
 }
 
 function scopeLabel(scope) {
+  const ref = reviewData.baseRef || "HEAD";
   switch (scope) {
-    case "git-diff": return "Git diff";
-    case "last-commit": return "Last commit";
+    case "git-diff": return ref === "HEAD" ? "Git diff" : `Diff vs ${ref}`;
+    case "last-commit": return ref === "HEAD" ? "Last commit" : `${ref} commit`;
     default: return "All files";
   }
 }
 
 function scopeHint(scope) {
+  const ref = reviewData.baseRef || "HEAD";
   switch (scope) {
     case "git-diff":
-      return "Review working tree changes against HEAD. Hover or click line numbers in the gutter to add an inline comment.";
+      return `Review working tree changes against ${ref}. Hover or click line numbers in the gutter to add an inline comment.`;
     case "last-commit":
-      return "Review the last commit against its parent. Hover or click line numbers in the gutter to add an inline comment.";
+      return `Review ${ref} against its parent. Hover or click line numbers in the gutter to add an inline comment.`;
     default:
       return "Review the current working tree snapshot. Hover or click line numbers in the gutter to add a code review comment.";
   }

@@ -44,8 +44,8 @@ export async function getRepoRoot(pi: ExtensionAPI, cwd: string): Promise<string
   return result.stdout.trim();
 }
 
-async function hasHead(pi: ExtensionAPI, repoRoot: string): Promise<boolean> {
-  const result = await pi.exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: repoRoot });
+async function verifyRef(pi: ExtensionAPI, repoRoot: string, ref: string): Promise<boolean> {
+  const result = await pi.exec("git", ["rev-parse", "--verify", ref], { cwd: repoRoot });
   return result.code === 0;
 }
 
@@ -256,18 +256,18 @@ function upsertSeed(seeds: Map<string, ReviewFileSeed>, key: string, create: () 
   return seed;
 }
 
-export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promise<{ repoRoot: string; files: ReviewFile[] }> {
+export async function getReviewWindowData(pi: ExtensionAPI, cwd: string, baseRef = "HEAD"): Promise<{ repoRoot: string; files: ReviewFile[]; baseRef: string }> {
   const repoRoot = await getRepoRoot(pi, cwd);
-  const repositoryHasHead = await hasHead(pi, repoRoot);
+  const refExists = await verifyRef(pi, repoRoot, baseRef);
 
-  const trackedDiffOutput = repositoryHasHead
-    ? await runGit(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", "HEAD", "--"])
+  const trackedDiffOutput = refExists
+    ? await runGit(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", baseRef, "--"])
     : "";
   const untrackedOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--others", "--exclude-standard"]);
   const trackedFilesOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--cached"]);
   const deletedFilesOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--deleted"]);
-  const lastCommitOutput = repositoryHasHead
-    ? await runGitAllowFailure(pi, repoRoot, ["diff-tree", "--root", "--find-renames", "-M", "--name-status", "--no-commit-id", "-r", "HEAD"])
+  const lastCommitOutput = refExists
+    ? await runGitAllowFailure(pi, repoRoot, ["diff-tree", "--root", "--find-renames", "-M", "--name-status", "--no-commit-id", "-r", baseRef])
     : "";
 
   const worktreeChanges = mergeChangedPaths(parseNameStatus(trackedDiffOutput), parseUntrackedPaths(untrackedOutput))
@@ -329,10 +329,10 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
     .map(createReviewFile)
     .sort(compareReviewFiles);
 
-  return { repoRoot, files };
+  return { repoRoot, files, baseRef };
 }
 
-export async function loadReviewFileContents(pi: ExtensionAPI, repoRoot: string, file: ReviewFile, scope: ReviewScope): Promise<ReviewFileContents> {
+export async function loadReviewFileContents(pi: ExtensionAPI, repoRoot: string, file: ReviewFile, scope: ReviewScope, baseRef = "HEAD"): Promise<ReviewFileContents> {
   if (scope === "all-files") {
     const content = file.hasWorkingTreeFile ? await getWorkingTreeContent(repoRoot, file.path) : "";
     return {
@@ -349,8 +349,8 @@ export async function loadReviewFileContents(pi: ExtensionAPI, repoRoot: string,
     };
   }
 
-  const originalRevision = scope === "git-diff" ? "HEAD" : "HEAD^";
-  const modifiedRevision = scope === "git-diff" ? null : "HEAD";
+  const originalRevision = scope === "git-diff" ? baseRef : `${baseRef}^`;
+  const modifiedRevision = scope === "git-diff" ? null : baseRef;
 
   const originalContent = comparison.oldPath == null ? "" : await getRevisionContent(pi, repoRoot, originalRevision, comparison.oldPath);
   const modifiedContent = comparison.newPath == null
