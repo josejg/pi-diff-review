@@ -1,3 +1,67 @@
+// --- WebSocket transport ---
+const _sessionToken = JSON.parse(document.getElementById("session-token").textContent || '""');
+const _wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+const _wsUrl = `${_wsProtocol}//${location.host}/?token=${encodeURIComponent(_sessionToken)}`;
+let _ws = null;
+let _wsConnected = false;
+let _disconnectBanner = null;
+
+function _sendToHost(message) {
+  if (_ws && _ws.readyState === WebSocket.OPEN) {
+    _ws.send(JSON.stringify(message));
+  }
+}
+
+function _showDisconnectBanner(text) {
+  if (_disconnectBanner) return;
+  _disconnectBanner = document.createElement("div");
+  _disconnectBanner.className = "fixed top-0 inset-x-0 z-[200] bg-red-900/90 text-white text-center py-2 text-sm font-medium";
+  _disconnectBanner.textContent = text;
+  document.body.appendChild(_disconnectBanner);
+}
+
+function _hideDisconnectBanner() {
+  if (_disconnectBanner) {
+    _disconnectBanner.remove();
+    _disconnectBanner = null;
+  }
+}
+
+function _connectWebSocket() {
+  _ws = new WebSocket(_wsUrl);
+
+  _ws.addEventListener("open", () => {
+    _wsConnected = true;
+    _hideDisconnectBanner();
+  });
+
+  _ws.addEventListener("message", (event) => {
+    try {
+      const message = JSON.parse(event.data);
+      if (typeof window.__reviewReceive === "function") {
+        window.__reviewReceive(message);
+      }
+    } catch {}
+  });
+
+  _ws.addEventListener("close", (event) => {
+    _wsConnected = false;
+    if (event.code === 1000) {
+      _showDisconnectBanner("Review session ended.");
+    } else {
+      _showDisconnectBanner("Disconnected from review server. Refresh to reconnect.");
+    }
+  });
+
+  _ws.addEventListener("error", () => {
+    _wsConnected = false;
+  });
+}
+
+_connectWebSocket();
+
+// --- End WebSocket transport ---
+
 const reviewData = JSON.parse(document.getElementById("diff-review-data").textContent || "{}");
 
 const state = {
@@ -355,9 +419,7 @@ function ensureFileLoaded(fileId, scope = state.currentScope) {
   const requestId = `request:${Date.now()}:${++requestSequence}`;
   state.pendingRequestIds[key] = requestId;
   renderTree();
-  if (window.glimpse?.send) {
-    window.glimpse.send({ type: "request-file", requestId, fileId, scope });
-  }
+  _sendToHost({ type: "request-file", requestId, fileId, scope });
 }
 
 function openFile(fileId) {
@@ -1028,13 +1090,11 @@ submitButton.addEventListener("click", () => {
       .map((comment) => ({ ...comment, body: comment.body.trim() }))
       .filter((comment) => comment.body.length > 0),
   };
-  window.glimpse.send(payload);
-  window.glimpse.close();
+  _sendToHost(payload);
 });
 
 cancelButton.addEventListener("click", () => {
-  window.glimpse.send({ type: "cancel" });
-  window.glimpse.close();
+  _sendToHost({ type: "cancel" });
 });
 
 overallCommentButton.addEventListener("click", () => {

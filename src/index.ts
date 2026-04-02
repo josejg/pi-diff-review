@@ -1,8 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
-import { open, type GlimpseWindow } from "glimpseui";
 import { getReviewWindowData, loadReviewFileContents } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
+import { startReviewServer, type ReviewSession } from "./server.js";
 import type {
   ReviewCancelPayload,
   ReviewFile,
@@ -12,7 +12,6 @@ import type {
   ReviewSubmitPayload,
   ReviewWindowMessage,
 } from "./types.js";
-import { buildReviewHtml } from "./ui.js";
 
 function isSubmitPayload(value: ReviewWindowMessage): value is ReviewSubmitPayload {
   return value.type === "submit";
@@ -28,24 +27,20 @@ function isRequestFilePayload(value: ReviewWindowMessage): value is ReviewReques
 
 type WaitingEditorResult = "escape" | "window-settled";
 
-function escapeForInlineScript(value: string): string {
-  return value.replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
-}
-
 export default function (pi: ExtensionAPI) {
-  let activeWindow: GlimpseWindow | null = null;
+  let activeSession: ReviewSession | null = null;
   let activeWaitingUIDismiss: (() => void) | null = null;
 
-  function closeActiveWindow(): void {
-    if (activeWindow == null) return;
-    const windowToClose = activeWindow;
-    activeWindow = null;
+  function closeActiveSession(): void {
+    if (activeSession == null) return;
+    const session = activeSession;
+    activeSession = null;
     try {
-      windowToClose.close();
+      session.close();
     } catch {}
   }
 
-  function showWaitingUI(ctx: ExtensionCommandContext): {
+  function showWaitingUI(ctx: ExtensionCommandContext, session: ReviewSession): {
     promise: Promise<WaitingEditorResult>;
     dismiss: () => void;
   } {
@@ -81,8 +76,11 @@ export default function (pi: ExtensionAPI) {
           const borderBottom = theme.fg("border", `╰${"─".repeat(innerWidth)}╯`);
           const lines = [
             theme.fg("accent", theme.bold("Waiting for review")),
-            "The native review window is open.",
-            "Press Escape to cancel and close the review window.",
+            `Open review UI: ${session.url}`,
+            "",
+            `ssh -L ${session.port}:127.0.0.1:${session.port} user@remote`,
+            "",
+            "Press Escape to cancel.",
           ];
           return [
             borderTop,
@@ -112,8 +110,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function reviewRepository(ctx: ExtensionCommandContext): Promise<void> {
-    if (activeWindow != null) {
-      ctx.ui.notify("A review window is already open.", "warning");
+    if (activeSession != null) {
+      ctx.ui.notify("A review session is already active.", "warning");
       return;
     }
 
@@ -123,154 +121,142 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const html = buildReviewHtml({ repoRoot, files });
-    const window = open(html, {
-      width: 1680,
-      height: 1020,
-      title: "pi review",
-    });
-    activeWindow = window;
-
-    const waitingUI = showWaitingUI(ctx);
     const fileMap = new Map(files.map((file) => [file.id, file]));
     const contentCache = new Map<string, Promise<ReviewFileContents>>();
 
-    const sendWindowMessage = (message: ReviewHostMessage): void => {
-      if (activeWindow !== window) return;
-      const payload = escapeForInlineScript(JSON.stringify(message));
-      window.send(`window.__reviewReceive(${payload});`);
-    };
+    // Terminal message settlement
+    let settleTerminal: ((value: ReviewSubmitPayload | ReviewCancelPayload | null) => void) | null = null;
+    const terminalPromise = new Promise<ReviewSubmitPayload | ReviewCancelPayload | null>((resolve) => {
+      settleTerminal = resolve;
+    });
 
     const loadContents = (file: ReviewFile, scope: ReviewRequestFilePayload["scope"]): Promise<ReviewFileContents> => {
-      const cacheKey = `${scope}:${file.id}`;
-      const cached = contentCache.get(cacheKey);
+      const key = `${scope}:${file.id}`;
+      const cached = contentCache.get(key);
       if (cached != null) return cached;
-
       const pending = loadReviewFileContents(pi, repoRoot, file, scope);
-      contentCache.set(cacheKey, pending);
+      contentCache.set(key, pending);
       return pending;
     };
 
-    ctx.ui.notify("Opened native review window.", "info");
+    const sendMessage = (message: ReviewHostMessage): void => {
+      if (activeSession == null) return;
+      activeSession.send(message);
+    };
+
+    const handleRequestFile = async (message: ReviewRequestFilePayload): Promise<void> => {
+      const file = fileMap.get(message.fileId);
+      if (file == null) {
+        sendMessage({
+          type: "file-error",
+          requestId: message.requestId,
+          fileId: message.fileId,
+          scope: message.scope,
+          message: "Unknown file requested.",
+        });
+        return;
+      }
+
+      try {
+        const contents = await loadContents(file, message.scope);
+        sendMessage({
+          type: "file-data",
+          requestId: message.requestId,
+          fileId: message.fileId,
+          scope: message.scope,
+          originalContent: contents.originalContent,
+          modifiedContent: contents.modifiedContent,
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : String(error);
+        sendMessage({
+          type: "file-error",
+          requestId: message.requestId,
+          fileId: message.fileId,
+          scope: message.scope,
+          message: messageText,
+        });
+      }
+    };
+
+    const onBrowserMessage = (message: ReviewWindowMessage): void => {
+      if (isRequestFilePayload(message)) {
+        void handleRequestFile(message);
+        return;
+      }
+      if (isSubmitPayload(message) || isCancelPayload(message)) {
+        if (settleTerminal != null) {
+          const fn = settleTerminal;
+          settleTerminal = null;
+          fn(message);
+        }
+      }
+    };
+
+    let session: ReviewSession;
+    try {
+      session = await startReviewServer({ repoRoot, files }, onBrowserMessage);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Failed to start review server: ${msg}`, "error");
+      return;
+    }
+
+    activeSession = session;
+
+    ctx.ui.notify(`Review server started on port ${session.port}.`, "info");
+
+    const waitingUI = showWaitingUI(ctx, session);
 
     try {
-      const terminalMessagePromise = new Promise<ReviewSubmitPayload | ReviewCancelPayload | null>((resolve, reject) => {
-        let settled = false;
-
-        const cleanup = (): void => {
-          window.removeListener("message", onMessage);
-          window.removeListener("closed", onClosed);
-          window.removeListener("error", onError);
-          if (activeWindow === window) {
-            activeWindow = null;
+      // Also settle on server session timeout/close
+      const serverResult = session.waitForResult().then((msg) => {
+        if (msg != null && (isSubmitPayload(msg) || isCancelPayload(msg))) {
+          if (settleTerminal != null) {
+            const fn = settleTerminal;
+            settleTerminal = null;
+            fn(msg);
           }
-        };
-
-        const settle = (value: ReviewSubmitPayload | ReviewCancelPayload | null): void => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          resolve(value);
-        };
-
-        const handleRequestFile = async (message: ReviewRequestFilePayload): Promise<void> => {
-          const file = fileMap.get(message.fileId);
-          if (file == null) {
-            sendWindowMessage({
-              type: "file-error",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              message: "Unknown file requested.",
-            });
-            return;
-          }
-
-          try {
-            const contents = await loadContents(file, message.scope);
-            sendWindowMessage({
-              type: "file-data",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              originalContent: contents.originalContent,
-              modifiedContent: contents.modifiedContent,
-            });
-          } catch (error) {
-            const messageText = error instanceof Error ? error.message : String(error);
-            sendWindowMessage({
-              type: "file-error",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              message: messageText,
-            });
-          }
-        };
-
-        const onMessage = (data: unknown): void => {
-          const message = data as ReviewWindowMessage;
-          if (isRequestFilePayload(message)) {
-            void handleRequestFile(message);
-            return;
-          }
-          if (isSubmitPayload(message) || isCancelPayload(message)) {
-            settle(message);
-          }
-        };
-
-        const onClosed = (): void => {
-          settle(null);
-        };
-
-        const onError = (error: Error): void => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          reject(error);
-        };
-
-        window.on("message", onMessage);
-        window.on("closed", onClosed);
-        window.on("error", onError);
+        }
+        return { type: "server" as const, message: msg };
       });
 
       const result = await Promise.race([
-        terminalMessagePromise.then((message) => ({ type: "window" as const, message })),
+        terminalPromise.then((message) => ({ type: "terminal" as const, message })),
         waitingUI.promise.then((reason) => ({ type: "ui" as const, reason })),
+        serverResult,
       ]);
 
       if (result.type === "ui" && result.reason === "escape") {
-        closeActiveWindow();
-        await terminalMessagePromise.catch(() => null);
+        closeActiveSession();
         ctx.ui.notify("Review cancelled.", "info");
         return;
       }
 
-      const message = result.type === "window" ? result.message : await terminalMessagePromise;
+      const message = result.type === "terminal" ? result.message : result.type === "server" ? result.message : await terminalPromise;
 
       waitingUI.dismiss();
       await waitingUI.promise;
-      closeActiveWindow();
+      closeActiveSession();
 
       if (message == null || message.type === "cancel") {
         ctx.ui.notify("Review cancelled.", "info");
         return;
       }
 
-      const prompt = composeReviewPrompt(files, message);
+      const prompt = composeReviewPrompt(files, message as ReviewSubmitPayload);
       ctx.ui.setEditorText(prompt);
       ctx.ui.notify("Inserted review feedback into the editor.", "info");
     } catch (error) {
       activeWaitingUIDismiss?.();
-      closeActiveWindow();
+      closeActiveSession();
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(`Review failed: ${message}`, "error");
     }
   }
 
   pi.registerCommand("diff-review", {
-    description: "Open a native review window with git diff, last commit, and all files scopes",
+    description: "Start a review server for git diff, last commit, and all files scopes",
     handler: async (_args, ctx) => {
       await reviewRepository(ctx);
     },
@@ -278,6 +264,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     activeWaitingUIDismiss?.();
-    closeActiveWindow();
+    closeActiveSession();
   });
 }
